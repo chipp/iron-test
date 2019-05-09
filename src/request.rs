@@ -5,7 +5,7 @@ use hyper::net::NetworkStream;
 
 use iron;
 use iron::prelude::*;
-use iron::{Handler, headers, Headers, method, Url};
+use iron::{headers, method, BeforeMiddleware, Handler, Headers, Url};
 
 use std::io::Cursor;
 
@@ -17,17 +17,32 @@ pub fn get<H: Handler>(path: &str, headers: Headers, handler: &H) -> IronResult<
 }
 
 /// Convenience method for making POST requests with a body to Iron Handlers.
-pub fn post<H: Handler>(path: &str, headers: Headers, body: &str, handler: &H) -> IronResult<Response> {
+pub fn post<H: Handler>(
+    path: &str,
+    headers: Headers,
+    body: &str,
+    handler: &H,
+) -> IronResult<Response> {
     request(method::Post, path, body, headers, handler)
 }
 
 /// Convenience method for making PATCH requests with a body to Iron Handlers.
-pub fn patch<H: Handler>(path: &str, headers: Headers, body: &str, handler: &H) -> IronResult<Response> {
+pub fn patch<H: Handler>(
+    path: &str,
+    headers: Headers,
+    body: &str,
+    handler: &H,
+) -> IronResult<Response> {
     request(method::Patch, path, body, headers, handler)
 }
 
 /// Convenience method for making PUT requests with a body to Iron Handlers.
-pub fn put<H: Handler>(path: &str, headers: Headers, body: &str, handler: &H) -> IronResult<Response> {
+pub fn put<H: Handler>(
+    path: &str,
+    headers: Headers,
+    body: &str,
+    handler: &H,
+) -> IronResult<Response> {
     request(method::Put, path, body, headers, handler)
 }
 
@@ -48,15 +63,61 @@ pub fn head<H: Handler>(path: &str, headers: Headers, handler: &H) -> IronResult
 
 /// Constructs an Iron::Request from the given parts and passes it to the
 /// `handle` method on the given Handler.
-pub fn request<H: Handler>(method: method::Method,
-                           path: &str,
-                           body: &str,
-                           headers: Headers,
-                           handler: &H) -> IronResult<Response> {
-    let url = Url::parse(path).unwrap();
-    // From iron 0.5.x, iron::Request contains private field. So, it is not good to
-    // create iron::Request directly. Make http request and parse it with hyper,
-    // and make iron::Request from hyper::client::Request.
+pub fn request<H: Handler>(
+    method: method::Method,
+    url: &str,
+    body: &str,
+    headers: Headers,
+    handler: &H,
+) -> IronResult<Response> {
+    let url = Url::parse(url).unwrap();
+
+    let message = prepare_message(method, &url, body, headers);
+
+    let addr = "127.0.0.1:3000".parse().unwrap();
+    let protocol = match url.scheme() {
+        "http" => iron::Protocol::http(),
+        "https" => iron::Protocol::https(),
+        _ => panic!("unknown protocol {}", url.scheme()),
+    };
+
+    let mut stream = MockStream::new(Cursor::new(message.as_bytes().to_vec()));
+    let mut buf_reader = BufReader::new(&mut stream as &mut NetworkStream);
+    let http_request = hyper::server::Request::new(&mut buf_reader, addr).unwrap();
+    let mut req = Request::from_http(http_request, addr, &protocol).unwrap();
+
+    handler.handle(&mut req)
+}
+
+/// Constructs an Iron::Request from the given parts and passes it to the
+/// `before` method on the given BeforeMiddleware.
+pub fn before_request<B: BeforeMiddleware>(
+    method: method::Method,
+    url: &str,
+    body: &str,
+    headers: Headers,
+    before: &B,
+) -> IronResult<()> {
+    let url = Url::parse(url).unwrap();
+
+    let message = prepare_message(method, &url, body, headers);
+
+    let addr = "127.0.0.1:3000".parse().unwrap();
+    let protocol = match url.scheme() {
+        "http" => iron::Protocol::http(),
+        "https" => iron::Protocol::https(),
+        _ => panic!("unknown protocol {}", url.scheme()),
+    };
+
+    let mut stream = MockStream::new(Cursor::new(message.as_bytes().to_vec()));
+    let mut buf_reader = BufReader::new(&mut stream as &mut NetworkStream);
+    let http_request = hyper::server::Request::new(&mut buf_reader, addr).unwrap();
+    let mut req = Request::from_http(http_request, addr, &protocol).unwrap();
+
+    before.before(&mut req)
+}
+
+fn prepare_message(method: method::Method, url: &Url, body: &str, headers: Headers) -> String {
     let mut buffer = String::new();
     buffer.push_str(&format!("{} {} HTTP/1.1\r\n", &method, url));
     buffer.push_str(&format!("Content-Length: {}\r\n", body.len() as u64));
@@ -69,19 +130,7 @@ pub fn request<H: Handler>(method: method::Method,
     buffer.push_str("\r\n");
     buffer.push_str(body);
 
-    let addr = "127.0.0.1:3000".parse().unwrap();
-    let protocol = match url.scheme() {
-        "http" => iron::Protocol::http(),
-        "https" => iron::Protocol::https(),
-        _ => panic!("unknown protocol {}", url.scheme()),
-    };
-
-    let mut stream = MockStream::new(Cursor::new(buffer.as_bytes().to_vec()));
-    let mut buf_reader = BufReader::new(&mut stream as &mut NetworkStream);
-    let http_request = hyper::server::Request::new(&mut buf_reader, addr).unwrap();
-    let mut req = Request::from_http(http_request, addr, &protocol).unwrap();
-
-    handler.handle(&mut req)
+    buffer
 }
 
 #[cfg(test)]
@@ -92,7 +141,7 @@ mod test {
     use iron::headers::Headers;
     use iron::mime::Mime;
     use iron::prelude::*;
-    use iron::{Handler, headers, status};
+    use iron::{headers, status, Handler};
 
     use response::{extract_body_to_bytes, extract_body_to_string};
 
@@ -112,7 +161,8 @@ mod test {
 
     impl Handler for RouterHandler {
         fn handle(&self, req: &mut Request) -> IronResult<Response> {
-            let params = req.extensions
+            let params = req
+                .extensions
                 .get::<router::Router>()
                 .expect("Expected to get a Router from the request extensions.");
             let id = params.find("id").unwrap();
@@ -125,7 +175,8 @@ mod test {
 
     impl Handler for PostHandler {
         fn handle(&self, req: &mut Request) -> IronResult<Response> {
-            let body = req.get_ref::<UrlEncodedBody>()
+            let body = req
+                .get_ref::<UrlEncodedBody>()
                 .expect("Expected to extract a UrlEncodedBody from the request");
             let first_name = body.get("first_name").unwrap()[0].to_owned();
             let last_name = body.get("last_name").unwrap()[0].to_owned();
@@ -139,18 +190,23 @@ mod test {
     impl Handler for UpdateHandler {
         fn handle(&self, req: &mut Request) -> IronResult<Response> {
             let id = {
-                let params = req.extensions
+                let params = req
+                    .extensions
                     .get::<router::Router>()
                     .expect("Expected to get a Router from request extensions.");
                 params.find("id").unwrap().parse::<String>().unwrap()
             };
 
-            let body = req.get_ref::<UrlEncodedBody>()
+            let body = req
+                .get_ref::<UrlEncodedBody>()
                 .expect("Expected to extract a UrlEncodedBody from the request");
             let first_name = body.get("first_name").unwrap()[0].to_owned();
             let last_name = body.get("last_name").unwrap()[0].to_owned();
 
-            Ok(Response::with((status::Ok, [first_name, last_name, id].join(" "))))
+            Ok(Response::with((
+                status::Ok,
+                [first_name, last_name, id].join(" "),
+            )))
         }
     }
 
@@ -179,6 +235,35 @@ mod test {
         }
     }
 
+    #[derive(Debug)]
+    struct AuthError;
+
+    impl std::fmt::Display for AuthError {
+        fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            std::fmt::Debug::fmt(self, f)
+        }
+    }
+
+    impl std::error::Error for AuthError {
+        fn description(&self) -> &str {
+            "auth error"
+        }
+    }
+
+    struct AuthorizationValidator;
+
+    impl BeforeMiddleware for AuthorizationValidator {
+        fn before(&self, req: &mut Request) -> IronResult<()> {
+            let auth = req.headers.get::<headers::Authorization<String>>().unwrap();
+
+            if auth.0 == "valid.token" {
+                Ok(())
+            } else {
+                Err(IronError::new(AuthError, status::Forbidden))
+            }
+        }
+    }
+
     #[test]
     fn test_get() {
         let response = get("http://localhost:3000", Headers::new(), &HelloWorldHandler);
@@ -192,10 +277,12 @@ mod test {
         let mut headers = Headers::new();
         let mime: Mime = "application/x-www-form-urlencoded".parse().unwrap();
         headers.set(headers::ContentType(mime));
-        let response = post("http://localhost:3000/users",
-                            headers,
-                            "first_name=Example&last_name=User",
-                            &PostHandler);
+        let response = post(
+            "http://localhost:3000/users",
+            headers,
+            "first_name=Example&last_name=User",
+            &PostHandler,
+        );
         let result = extract_body_to_bytes(response.unwrap());
 
         assert_eq!(result, b"Example User");
@@ -209,10 +296,12 @@ mod test {
         let mut headers = Headers::new();
         let mime: Mime = "application/x-www-form-urlencoded".parse().unwrap();
         headers.set(headers::ContentType(mime));
-        let response = patch("http://localhost:3000/users/1",
-                             headers,
-                             "first_name=Example&last_name=User",
-                             &router);
+        let response = patch(
+            "http://localhost:3000/users/1",
+            headers,
+            "first_name=Example&last_name=User",
+            &router,
+        );
         let result = extract_body_to_bytes(response.unwrap());
 
         assert_eq!(result, b"Example User 1");
@@ -226,10 +315,12 @@ mod test {
         let mut headers = Headers::new();
         let mime: Mime = "application/x-www-form-urlencoded".parse().unwrap();
         headers.set(headers::ContentType(mime));
-        let response = put("http://localhost:3000/users/2",
-                           headers,
-                           "first_name=Example&last_name=User",
-                           &router);
+        let response = put(
+            "http://localhost:3000/users/2",
+            headers,
+            "first_name=Example&last_name=User",
+            &router,
+        );
         let result = extract_body_to_bytes(response.unwrap());
 
         assert_eq!(result, b"Example User 2");
@@ -246,10 +337,13 @@ mod test {
         assert_eq!(result, b"1");
     }
 
-
     #[test]
     fn test_options() {
-        let response = options("http://localhost:3000/users/options", Headers::new(), &OptionsHandler);
+        let response = options(
+            "http://localhost:3000/users/options",
+            Headers::new(),
+            &OptionsHandler,
+        );
         let result = extract_body_to_bytes(response.unwrap());
 
         assert_eq!(result, b"ALLOW: GET,POST");
@@ -284,9 +378,45 @@ mod test {
 
     #[test]
     fn test_percent_decoded_url() {
-        let response = head("http://localhost:3000/some path with spaces", Headers::new(), &HeadHandler);
+        let response = head(
+            "http://localhost:3000/some path with spaces",
+            Headers::new(),
+            &HeadHandler,
+        );
         let result = extract_body_to_bytes(response.unwrap());
 
         assert_eq!(result, b"");
+    }
+
+    #[test]
+    fn test_before_request_success() {
+        let mut headers = Headers::new();
+        headers.set(headers::Authorization("valid.token".to_owned()));
+
+        before_request(
+            method::Get,
+            "http://localhost:3000/",
+            "",
+            headers,
+            &AuthorizationValidator,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_before_request_error() {
+        let mut headers = Headers::new();
+        headers.set(headers::Authorization("invalid.token".to_owned()));
+
+        let _ = before_request(
+            method::Get,
+            "http://localhost:3000/",
+            "",
+            headers,
+            &AuthorizationValidator,
+        )
+        .unwrap_err()
+        .error
+        .downcast::<AuthError>();
     }
 }
